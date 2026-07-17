@@ -64,6 +64,11 @@ voxpaste --clean
   sudo dnf install portaudio xclip
   ```
 
+  On PipeWire systems, PortAudio is optional: if `libportaudio` is not
+  installed, Voxpaste records through `pw-record` instead (part of
+  `pipewire-utils`/`pipewire-tools`, preinstalled on most modern
+  desktops). See [Recorder backend](#recorder-backend).
+
   **macOS:**
 
   ```bash
@@ -153,6 +158,19 @@ You can customize which model to use for each provider by setting the correspond
 | OpenRouter | `OPENROUTER_MODEL`   | `mistralai/voxtral-small-24b-2507` | `google/gemini-2.5-flash`, `google/gemini-3-flash-preview` - see [audio models](https://openrouter.ai/models?supported_parameters=audio) |
 
 If not specified, the default model for each provider will be used.
+
+### Recorder backend
+
+Voxpaste picks a recording backend automatically:
+
+- **PortAudio** (via [sounddevice](https://python-sounddevice.readthedocs.io/)) — the default whenever the PortAudio library is available. On macOS and Windows it ships with the Python package; on Linux it comes from your distro (see [Prerequisites](#prerequisites)).
+- **PipeWire** (`pw-record`) — used on Linux when PortAudio is not installed.
+
+Set `VOXPASTE_RECORDER` to force a specific backend:
+
+```bash
+VOXPASTE_RECORDER=pipewire   # or: portaudio (default: auto)
+```
 
 ### Setting up your API key
 

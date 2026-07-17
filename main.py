@@ -5,17 +5,26 @@ import argparse
 import io
 import os
 import platform
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
+import wave
 from pathlib import Path
 from typing import Protocol
 
 from dotenv import load_dotenv
 import httpx
 import numpy as np
-import sounddevice as sd
 from scipy.io import wavfile
+
+try:
+    import sounddevice as sd
+except (ImportError, OSError):
+    # PortAudio is not installed on every system (e.g. minimal Linux with
+    # PipeWire only); the pipewire recorder backend covers that case.
+    sd = None
 
 
 SAMPLE_RATE = 16000
@@ -765,8 +774,8 @@ def transcribe_with_fallback(audio_bytes: bytes) -> TranscriptionResult:
         )
 
 
-def record_audio() -> np.ndarray:
-    """Record audio from microphone until Enter is pressed."""
+def record_audio_portaudio() -> tuple[bytes, float]:
+    """Record via sounddevice/PortAudio until Enter is pressed."""
     print("Recording... Press Enter to stop.")
 
     frames = []
@@ -789,15 +798,92 @@ def record_audio() -> np.ndarray:
     if not frames:
         raise VoxPasteError("No audio recorded")
 
-    return np.concatenate(frames, axis=0)
-
-
-def audio_to_wav_bytes(audio_data: np.ndarray) -> bytes:
-    """Convert numpy audio array to WAV bytes."""
+    audio_data = np.concatenate(frames, axis=0)
     buffer = io.BytesIO()
     wavfile.write(buffer, SAMPLE_RATE, audio_data)
-    buffer.seek(0)
-    return buffer.read()
+    return buffer.getvalue(), len(audio_data) / SAMPLE_RATE
+
+
+def record_audio_pipewire() -> tuple[bytes, float]:
+    """Record via pw-record (PipeWire) until Enter is pressed."""
+    print("Recording... Press Enter to stop.")
+
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        wav_path = Path(tmp.name)
+
+    try:
+        process = subprocess.Popen(
+            [
+                "pw-record",
+                "--rate", str(SAMPLE_RATE),
+                "--channels", str(CHANNELS),
+                "--format", "s16",
+                str(wav_path),
+            ],
+            stderr=subprocess.PIPE,
+        )
+        try:
+            input()
+        finally:
+            # pw-record finalizes the WAV header on SIGTERM
+            process.terminate()
+            try:
+                _, stderr = process.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                _, stderr = process.communicate()
+
+        print("Recording stopped.")
+
+        # pw-record finalizes the WAV on SIGTERM but exits non-zero, so the
+        # file — not the exit code — is the success signal.
+        try:
+            with wave.open(str(wav_path)) as recording:
+                frame_count = recording.getnframes()
+                duration = frame_count / recording.getframerate()
+        except (wave.Error, EOFError) as exc:
+            raise VoxPasteError(
+                f"pw-record produced no usable audio ({exc})\n"
+                f"{stderr.decode(errors='replace').strip()}"
+            )
+
+        if frame_count == 0:
+            raise VoxPasteError("No audio recorded")
+
+        return wav_path.read_bytes(), duration
+    finally:
+        wav_path.unlink(missing_ok=True)
+
+
+def record_audio() -> tuple[bytes, float]:
+    """Record from the microphone, returning WAV bytes and the duration.
+
+    Backend is chosen automatically: sounddevice/PortAudio when available,
+    otherwise pw-record on PipeWire systems. Set VOXPASTE_RECORDER to
+    'portaudio' or 'pipewire' to force one.
+    """
+    backend = os.environ.get("VOXPASTE_RECORDER", "auto").lower()
+
+    if backend == "portaudio" or (backend == "auto" and sd is not None):
+        if sd is None:
+            raise VoxPasteError(
+                "VOXPASTE_RECORDER=portaudio but the PortAudio library is "
+                "not available"
+            )
+        return record_audio_portaudio()
+
+    if backend in ("pipewire", "auto"):
+        if shutil.which("pw-record") is None:
+            raise VoxPasteError(
+                "No recording backend available: PortAudio is not installed "
+                "and pw-record was not found"
+            )
+        return record_audio_pipewire()
+
+    raise VoxPasteError(
+        f"Unknown VOXPASTE_RECORDER '{backend}' (use 'auto', 'portaudio' "
+        "or 'pipewire')"
+    )
 
 
 def copy_to_clipboard(text: str) -> None:
@@ -860,12 +946,9 @@ def main():
     args = parser.parse_args()
 
     try:
-        audio_data = record_audio()
+        audio_bytes, duration = record_audio()
 
-        duration = len(audio_data) / SAMPLE_RATE
         print(f"Recorded {duration:.1f} seconds of audio")
-
-        audio_bytes = audio_to_wav_bytes(audio_data)
 
         print("Transcribing...")
         transcription_result = transcribe_with_fallback(audio_bytes)
